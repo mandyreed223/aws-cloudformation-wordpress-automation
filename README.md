@@ -2,7 +2,7 @@
 
 **From a Simplilearn course assignment to a two-Availability-Zone WordPress environment with persistent storage, automated EC2 recovery, HTTPS, and infrastructure as code.**
 
-![Highly Available WordPress on AWS architecture](assets/architecture/wordpress-ha-architecture.png)
+![Highly Available WordPress on AWS architecture](architecture/wordpress-ha-architecture.png)
 
 > **Project status:** Lab completed, tested, and torn down to avoid ongoing AWS charges. The WordPress URL and infrastructure are **not currently live**. The screenshots document the deployed environment and its tests.
 

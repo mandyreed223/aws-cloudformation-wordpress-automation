@@ -17,27 +17,16 @@ The result was a hands-on lesson in the difference between **provisioning infras
 ## 🎯 Goals and outcomes
 
 | Goal | Implementation / observed result |
-
 | --- | --- |
-
 | Reproducible infrastructure | AWS CloudFormation template provisions the network, compute, storage, database, monitoring, and scheduling resources. |
-
 | Availability across two AZs | EC2 Auto Scaling Group spans private application subnets in `us-east-1a` and `us-east-1b`. |
-
 | Automatic instance recovery | Tested unhealthy-instance replacement; Auto Scaling activity and healthy ALB targets were captured. |
-
 | Persistent WordPress files | One Amazon EFS file system, with a mount target in each application AZ. |
-
 | Persistent WordPress database | Amazon RDS MariaDB, encrypted storage, Multi-AZ enabled, and private database subnets. |
-
 | Secure browser access | Route 53 alias and an ACM-backed HTTPS listener on the Application Load Balancer. |
-
 | Reduced public exposure | WordPress EC2 instances have private IP addresses and no public IPs; RDS is not publicly accessible. |
-
 | Development scheduling | EventBridge Scheduler definitions scale ASG capacity up/down on weekdays; both schedules are disabled by default; ASG capacity changes were tested manually. |
-
 | Monitoring | CloudWatch CPU alarm configured at 80%, for monitoring rather than automatic scaling. |
-
 | Responsible teardown | Deleted the CloudFormation stack, checked key resources, and removed the temporary WordPress DNS alias. |
 
 ## 🏗️ Architecture
@@ -49,13 +38,9 @@ The result was a hands-on lesson in the difference between **provisioning infras
 **Availability Zones:** `us-east-1a` and `us-east-1b`
 
 | Subnet | AZ A | AZ B |
-
 | --- | --- | --- |
-
 | Public | `10.0.1.0/24` | `10.0.2.0/24` |
-
 | Private application | `10.0.11.0/24` | `10.0.12.0/24` |
-
 | Private database | `10.0.21.0/24` | `10.0.22.0/24` |
 
 ### Request and data flow
@@ -79,31 +64,18 @@ The result was a hands-on lesson in the difference between **provisioning infras
 ### AWS services
 
 | Service | Purpose |
-
 | --- | --- |
-
 | CloudFormation | Infrastructure as code |
-
 | VPC, subnets, route tables, internet gateway | Network segmentation and routing |
-
 | NAT Gateway × 2 | Outbound internet access from private application subnets |
-
 | EC2 and Auto Scaling | WordPress web servers and replacement of unhealthy instances |
-
 | Application Load Balancer | HTTPS entry point, routing, and target health checks |
-
 | Amazon EFS | Shared WordPress application files and uploads |
-
 | Amazon RDS for MariaDB | Managed, encrypted Multi-AZ database |
-
 | Secrets Manager | Managed database credentials |
-
 | IAM and Systems Manager | Instance permissions and operational access |
-
 | Route 53 and ACM | DNS and HTTPS certificate |
-
 | EventBridge Scheduler | Weekday development ASG capacity scheduling |
-
 | CloudWatch | CPU monitoring alarm |
 
 ## 📁 Repository structure
@@ -118,10 +90,9 @@ The result was a hands-on lesson in the difference between **provisioning infras
 ├── scripts/
 │   ├── wordpress-config.py           # WordPress configuration helper
 │   └── wordpress-userdata.sh         # User-data helper/reference
-├── assets/
-│   └── architecture/
-│       ├── wordpress-ha-architecture.png
-│       └── wordpress-ha-architecture.svg
+├── architecture/
+│   ├── wordpress-ha-architecture.png
+│   └── wordpress-ha-architecture.svg
 └── screenshots/
     ├── 01-deployment/
     ├── 02-network-and-security/
@@ -223,11 +194,8 @@ CloudFormation can successfully create infrastructure while user-data initializa
 The development environment includes **EventBridge Scheduler** resources to adjust Auto Scaling capacity:
 
 | Schedule | Intended behavior | Time zone |
-
 | --- | --- | --- |
-
 | Weekday start | Set ASG minimum and desired capacity to **2** at **9:00 AM**, Monday–Friday | `America/New_York` |
-
 | Weekday stop | Set ASG minimum and desired capacity to **0** at **6:00 PM**, Monday–Friday | `America/New_York` |
 
 **Important:** This scales the ASG to zero; it does **not** stop the RDS database, NAT gateways, or load balancer. Those resources can continue generating charges.

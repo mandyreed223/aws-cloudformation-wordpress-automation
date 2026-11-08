@@ -1,0 +1,423 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Simplilearn WordPress CloudFormation Lab.
+  Deploys an Amazon Linux 2023 EC2 instance with
+  Apache, PHP, MariaDB, and WordPress.
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+
+Parameters:
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the VPC for WordPress deployment
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select a public subnet in the chosen VPC
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the WordPress server
+    AllowedValues:
+      - t3.micro
+      - t3.small
+
+  EnvironmentName:
+    Type: String
+    Default: Production
+    Description: Environment being deployed
+    AllowedValues:
+      - Production
+      - Development
+
+# ============================================================
+# CONDITIONS
+# ============================================================
+
+Conditions:
+
+  IsDevelopment: !Equals
+    - !Ref EnvironmentName
+    - Development
+
+# ============================================================
+# RESOURCES
+# ============================================================
+
+Resources:
+
+  # ----------------------------------------------------------
+  # WORDPRESS SECURITY GROUP
+  # ----------------------------------------------------------
+
+  WordPressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+
+    Properties:
+
+      GroupDescription: Allow HTTP access to WordPress
+
+      VpcId: !Ref VpcId
+
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-WordPress-SG'
+
+        - Key: Project
+          Value: Simplilearn-WordPress
+
+  # ----------------------------------------------------------
+  # WORDPRESS EC2 INSTANCE
+  # ----------------------------------------------------------
+
+  WordPressInstance:
+    Type: AWS::EC2::Instance
+
+    Properties:
+
+      ImageId: !Ref LatestAmiId
+
+      InstanceType: !Ref InstanceType
+
+      # Require IMDSv2 for EC2 instance metadata
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+
+      # Public network interface
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          SubnetId: !Ref SubnetId
+
+          GroupSet:
+            - !Ref WordPressSecurityGroup
+
+      # ------------------------------------------------------
+      # EC2 USER DATA
+      # ------------------------------------------------------
+
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euo pipefail
+
+          # --------------------------------------------------
+          # Install Apache, PHP, MariaDB, and required tools
+          # --------------------------------------------------
+
+          dnf update -y
+
+          dnf install -y \
+            httpd \
+            php \
+            php-mysqlnd \
+            php-fpm \
+            php-mbstring \
+            php-xml \
+            php-gd \
+            mariadb105-server \
+            wget \
+            tar \
+            openssl \
+            python3
+
+          # --------------------------------------------------
+          # Start Apache and MariaDB
+          # --------------------------------------------------
+
+          systemctl enable --now httpd
+          systemctl enable --now mariadb
+
+          # --------------------------------------------------
+          # Generate a database password
+          # --------------------------------------------------
+
+          DB_PASSWORD=$(openssl rand -hex 24)
+
+          # --------------------------------------------------
+          # Create WordPress database and database user
+          # --------------------------------------------------
+
+          mysql <<SQL
+          CREATE DATABASE wordpress;
+          CREATE USER 'wpuser'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
+          GRANT ALL PRIVILEGES ON wordpress.* TO 'wpuser'@'localhost';
+          FLUSH PRIVILEGES;
+          SQL
+
+          # --------------------------------------------------
+          # Download and install WordPress
+          # --------------------------------------------------
+
+          cd /tmp
+
+          wget -q https://wordpress.org/latest.tar.gz
+
+          tar -xzf latest.tar.gz
+
+          cp -a wordpress/. /var/www/html/
+
+          # --------------------------------------------------
+          # Configure WordPress database connection
+          # --------------------------------------------------
+
+          cp /var/www/html/wp-config-sample.php \
+            /var/www/html/wp-config.php
+
+          sed -i \
+            "s/database_name_here/wordpress/" \
+            /var/www/html/wp-config.php
+
+          sed -i \
+            "s/username_here/wpuser/" \
+            /var/www/html/wp-config.php
+
+          sed -i \
+            "s/password_here/$DB_PASSWORD/" \
+            /var/www/html/wp-config.php
+
+          # Remove the password from the shell variable
+          unset DB_PASSWORD
+
+          # --------------------------------------------------
+          # Generate unique WordPress authentication salts
+          # --------------------------------------------------
+
+          curl -fsSL \
+            https://api.wordpress.org/secret-key/1.1/salt/ \
+            -o /tmp/wp-salts
+
+          # Replace the eight sample definitions using Python
+          # instead of fragile multiline sed commands.
+
+          python3 <<'PYTHON'
+          import re
+          from pathlib import Path
+
+          config_path = Path("/var/www/html/wp-config.php")
+          salts_path = Path("/tmp/wp-salts")
+
+          config = config_path.read_text()
+          salts = salts_path.read_text()
+
+          expected_keys = [
+              "AUTH_KEY",
+              "SECURE_AUTH_KEY",
+              "LOGGED_IN_KEY",
+              "NONCE_KEY",
+              "AUTH_SALT",
+              "SECURE_AUTH_SALT",
+              "LOGGED_IN_SALT",
+              "NONCE_SALT",
+          ]
+
+          salt_definitions = {}
+
+          for line in salts.splitlines():
+              match = re.match(
+                  r"^define\(\s*'([^']+)'",
+                  line
+              )
+
+              if match:
+                  salt_definitions[match.group(1)] = line
+
+          if set(salt_definitions) != set(expected_keys):
+              raise RuntimeError(
+                  "WordPress salt download was incomplete"
+              )
+
+          for key in expected_keys:
+              pattern = (
+                  r"(?m)^define\(\s*'"
+                  + re.escape(key)
+                  + r"'\s*,.*\);\s*$"
+              )
+
+              config, count = re.subn(
+                  pattern,
+                  lambda match, key=key: salt_definitions[key],
+                  config
+              )
+
+              if count != 1:
+                  raise RuntimeError(
+                      f"Expected one definition for {key}, found {count}"
+                  )
+
+          config_path.write_text(config)
+          PYTHON
+
+          rm -f /tmp/wp-salts
+
+          # --------------------------------------------------
+          # Secure WordPress files
+          # --------------------------------------------------
+
+          chown -R apache:apache /var/www/html
+
+          find /var/www/html -type d -exec chmod 755 {} \;
+
+          find /var/www/html -type f -exec chmod 644 {} \;
+
+          chmod 640 /var/www/html/wp-config.php
+
+          # --------------------------------------------------
+          # Validate WordPress configuration
+          # --------------------------------------------------
+
+          php -l /var/www/html/wp-config.php
+
+          # --------------------------------------------------
+          # Restart Apache
+          # --------------------------------------------------
+
+          systemctl restart httpd
+
+      # ------------------------------------------------------
+      # RESOURCE TAGS
+      # ------------------------------------------------------
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-WordPress'
+
+        - Key: Project
+          Value: Simplilearn-WordPress
+
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ----------------------------------------------------------
+  # EVENTBRIDGE SCHEDULER IAM ROLE
+  # Development environment only
+  # ----------------------------------------------------------
+
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: IsDevelopment
+
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-SchedulerRole'
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+
+      Policies:
+        - PolicyName: WordPressDevelopmentScheduling
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${InstanceId}'
+                  - InstanceId: !Ref WordPressInstance
+
+      Tags:
+        - Key: Project
+          Value: Simplilearn-WordPress
+
+        - Key: Environment
+          Value: Development
+
+  # ----------------------------------------------------------
+  # DEVELOPMENT START SCHEDULE
+  # Monday through Friday at 9 AM Eastern
+  # ----------------------------------------------------------
+
+  DevelopmentStartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsDevelopment
+
+    Properties:
+      Description: Start Development WordPress at 9 AM Eastern
+
+      ScheduleExpression: 'cron(0 9 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: America/New_York
+
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+
+      State: ENABLED
+
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:startInstances
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+
+        Input: !Sub
+          - '{"InstanceIds":["${InstanceId}"]}'
+          - InstanceId: !Ref WordPressInstance
+
+  # ----------------------------------------------------------
+  # DEVELOPMENT STOP SCHEDULE
+  # Monday through Friday at 6 PM Eastern
+  # ----------------------------------------------------------
+
+  DevelopmentStopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsDevelopment
+
+    Properties:
+      Description: Stop Development WordPress at 6 PM Eastern
+
+      ScheduleExpression: 'cron(0 18 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: America/New_York
+
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+
+      State: ENABLED
+
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:stopInstances
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+
+        Input: !Sub
+          - '{"InstanceIds":["${InstanceId}"]}'
+          - InstanceId: !Ref WordPressInstance
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+
+Outputs:
+
+  WordPressInstanceId:
+    Description: EC2 instance ID for the WordPress server
+    Value: !Ref WordPressInstance
+
+  WordPressPublicIP:
+    Description: Public IPv4 address of the WordPress server
+    Value: !GetAtt WordPressInstance.PublicIp
+
+  WordPressURL:
+    Description: URL to access the WordPress website
+    Value: !Sub
+      - 'http://${PublicIP}'
+      - PublicIP: !GetAtt WordPressInstance.PublicIp

@@ -1,0 +1,1112 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Automated WordPress infrastructure deployed with AWS CloudFormation.
+  Uses an Application Load Balancer, EC2 Auto Scaling,
+  Amazon RDS MariaDB Multi-AZ, Amazon EFS, EventBridge Scheduler,
+  and CloudWatch monitoring to demonstrate infrastructure
+  automation, persistent storage, and automated recovery.
+  This is a disposable learning lab, not a production-hardened deployment.
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: Development
+    AllowedValues:
+      - Development
+      - Production
+    Description: Environment being deployed
+
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the WordPress VPC
+
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: Public subnet in Availability Zone 1
+
+  PublicSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: Public subnet in Availability Zone 2
+
+  PrivateAppSubnet1CIDR:
+    Type: String
+    Default: 10.0.11.0/24
+    Description: Private application subnet in Availability Zone 1
+
+  PrivateAppSubnet2CIDR:
+    Type: String
+    Default: 10.0.12.0/24
+    Description: Private application subnet in Availability Zone 2
+
+  PrivateDBSubnet1CIDR:
+    Type: String
+    Default: 10.0.21.0/24
+    Description: Private database subnet in Availability Zone 1
+
+  PrivateDBSubnet2CIDR:
+    Type: String
+    Default: 10.0.22.0/24
+    Description: Private database subnet in Availability Zone 2
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: Optional ACM certificate ARN in this region; required for secure WordPress admin access.
+
+# ============================================================
+# MAPPINGS
+# ============================================================
+
+Mappings:
+  EnvironmentConfig:
+    Development:
+      InstanceType: t3.micro
+      DBInstanceClass: db.t3.micro
+      MinCapacity: '2'
+      DesiredCapacity: '2'
+      MaxCapacity: '2'
+    Production:
+      InstanceType: t3.small
+      DBInstanceClass: db.t3.small
+      MinCapacity: '2'
+      DesiredCapacity: '2'
+      MaxCapacity: '4'
+
+# ============================================================
+# CONDITIONS
+# ============================================================
+
+Conditions:
+  IsDevelopment: !Equals [!Ref EnvironmentName, Development]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+
+# ============================================================
+# RESOURCES
+# ============================================================
+
+Resources:
+
+  # ==========================================================
+  # NETWORKING
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # VPC
+  # ----------------------------------------------------------
+  # !Ref VpcCIDR supplies the network range for our VPC.
+
+  WordPressVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-WordPress-VPC'
+
+
+  # ----------------------------------------------------------
+  # INTERNET GATEWAY
+  # ----------------------------------------------------------
+
+  WordPressInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-WordPress-IGW'
+
+
+  # ----------------------------------------------------------
+  # ATTACH INTERNET GATEWAY TO VPC
+  # ----------------------------------------------------------
+
+  WordPressVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref WordPressVPC
+      InternetGatewayId: !Ref WordPressInternetGateway
+
+
+  # ==========================================================
+  # SUBNETS
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # PUBLIC SUBNET 1
+  # ----------------------------------------------------------
+  # !Select [0, !GetAZs ...] chooses the first available AZ.
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: !Ref PublicSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Public-Subnet-1'
+
+
+  # ----------------------------------------------------------
+  # PUBLIC SUBNET 2
+  # ----------------------------------------------------------
+  # !Select [1, !GetAZs ...] chooses a different AZ.
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: !Ref PublicSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Public-Subnet-2'
+
+
+  # ----------------------------------------------------------
+  # PRIVATE APPLICATION SUBNET 1
+  # ----------------------------------------------------------
+  # Instances launch here without public IP addresses.
+
+  PrivateAppSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: !Ref PrivateAppSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Private-App-Subnet-1'
+
+
+  # ----------------------------------------------------------
+  # PRIVATE APPLICATION SUBNET 2
+  # ----------------------------------------------------------
+  # Second application AZ provides instance redundancy.
+
+  PrivateAppSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: !Ref PrivateAppSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Private-App-Subnet-2'
+
+
+  # ----------------------------------------------------------
+  # PRIVATE DATABASE SUBNET 1
+  # ----------------------------------------------------------
+
+  PrivateDBSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: !Ref PrivateDBSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Private-DB-Subnet-1'
+
+
+  # ----------------------------------------------------------
+  # PRIVATE DATABASE SUBNET 2
+  # ----------------------------------------------------------
+
+  PrivateDBSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: !Ref PrivateDBSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Private-DB-Subnet-2'
+
+
+  # ==========================================================
+  # ROUTE TABLES
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # PUBLIC ROUTE TABLE
+  # ----------------------------------------------------------
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WordPressVPC
+
+
+  # ----------------------------------------------------------
+  # PUBLIC INTERNET ROUTE
+  # ----------------------------------------------------------
+
+  PublicInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: WordPressVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref WordPressInternetGateway
+
+
+  # ----------------------------------------------------------
+  # ASSOCIATE PUBLIC SUBNET 1
+  # ----------------------------------------------------------
+
+  PublicSubnet1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+
+  # ----------------------------------------------------------
+  # ASSOCIATE PUBLIC SUBNET 2
+  # ----------------------------------------------------------
+
+  PublicSubnet2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+
+  # ==========================================================
+  # NAT GATEWAYS
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # NAT GATEWAY ELASTIC IP 1
+  # ----------------------------------------------------------
+
+  NATGatewayEIP1:
+    Type: AWS::EC2::EIP
+    DependsOn: WordPressVPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+
+  # ----------------------------------------------------------
+  # NAT GATEWAY ELASTIC IP 2
+  # ----------------------------------------------------------
+
+  NATGatewayEIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: WordPressVPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+
+  # ----------------------------------------------------------
+  # NAT GATEWAY 1 - AZ 1
+  # ----------------------------------------------------------
+  # !GetAtt EIP.AllocationId attaches an Elastic IP to NAT.
+
+  WordPressNATGateway1:
+    Type: AWS::EC2::NatGateway
+    DependsOn:
+      - PublicInternetRoute
+      - PublicSubnet1RouteAssociation
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+
+  # ----------------------------------------------------------
+  # NAT GATEWAY 2 - AZ 2
+  # ----------------------------------------------------------
+  # A second NAT avoids reliance on the first AZ for egress.
+
+  WordPressNATGateway2:
+    Type: AWS::EC2::NatGateway
+    DependsOn:
+      - PublicInternetRoute
+      - PublicSubnet2RouteAssociation
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+
+
+  # ==========================================================
+  # PRIVATE APPLICATION ROUTING
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # AZ 1 ROUTE TABLE
+  # ----------------------------------------------------------
+
+  PrivateAppRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WordPressVPC
+
+
+  # ----------------------------------------------------------
+  # AZ 2 ROUTE TABLE
+  # ----------------------------------------------------------
+
+  PrivateAppRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WordPressVPC
+
+
+  # ----------------------------------------------------------
+  # AZ 1 NAT ROUTE
+  # ----------------------------------------------------------
+
+  PrivateAppDefaultRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref WordPressNATGateway1
+
+
+  # ----------------------------------------------------------
+  # AZ 2 NAT ROUTE
+  # ----------------------------------------------------------
+
+  PrivateAppDefaultRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref WordPressNATGateway2
+
+
+  # ----------------------------------------------------------
+  # AZ 1 SUBNET ASSOCIATION
+  # ----------------------------------------------------------
+
+  PrivateAppSubnet1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet1
+      RouteTableId: !Ref PrivateAppRouteTable1
+
+
+  # ----------------------------------------------------------
+  # AZ 2 SUBNET ASSOCIATION
+  # ----------------------------------------------------------
+
+  PrivateAppSubnet2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet2
+      RouteTableId: !Ref PrivateAppRouteTable2
+
+
+  # ==========================================================
+  # PRIVATE DATABASE ROUTING
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # DATABASE ROUTE TABLE
+  # ----------------------------------------------------------
+  # No default internet route. Database subnets stay private.
+
+  PrivateDBRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WordPressVPC
+
+
+  # ----------------------------------------------------------
+  # DATABASE SUBNET 1 ASSOCIATION
+  # ----------------------------------------------------------
+
+  PrivateDBSubnet1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDBSubnet1
+      RouteTableId: !Ref PrivateDBRouteTable
+
+
+  # ----------------------------------------------------------
+  # DATABASE SUBNET 2 ASSOCIATION
+  # ----------------------------------------------------------
+
+  PrivateDBSubnet2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDBSubnet2
+      RouteTableId: !Ref PrivateDBRouteTable
+
+
+  # ==========================================================
+  # SECURITY GROUPS
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # APPLICATION LOAD BALANCER SECURITY GROUP
+  # ----------------------------------------------------------
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and optional HTTPS to ALB
+      VpcId: !Ref WordPressVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - !If
+          - HasCertificate
+          - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+          - !Ref AWS::NoValue
+
+
+  # ----------------------------------------------------------
+  # WORDPRESS EC2 SECURITY GROUP
+  # ----------------------------------------------------------
+  # Only traffic originating from the ALB security group reaches EC2.
+
+  WordPressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP only from ALB
+      VpcId: !Ref WordPressVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+
+  # ----------------------------------------------------------
+  # RDS DATABASE SECURITY GROUP
+  # ----------------------------------------------------------
+  # Only WordPress EC2 instances can reach MariaDB port 3306.
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MariaDB only from WordPress instances
+      VpcId: !Ref WordPressVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WordPressSecurityGroup
+
+
+  # ----------------------------------------------------------
+  # EFS SECURITY GROUP
+  # ----------------------------------------------------------
+  # Only WordPress EC2 instances can reach NFS port 2049.
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS only from WordPress instances
+      VpcId: !Ref WordPressVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WordPressSecurityGroup
+
+
+  # ==========================================================
+  # APPLICATION LOAD BALANCER
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # INTERNET-FACING LOAD BALANCER
+  # ----------------------------------------------------------
+
+  WordPressALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - PublicInternetRoute
+      - PublicSubnet1RouteAssociation
+      - PublicSubnet2RouteAssociation
+    Properties:
+      Name: !Sub '${EnvironmentName}-WordPress-ALB'
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+
+  # ----------------------------------------------------------
+  # WORDPRESS TARGET GROUP
+  # ----------------------------------------------------------
+  # /health.html is a basic server health check, not a full DB check.
+
+  WordPressTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-WordPress-TG'
+      VpcId: !Ref WordPressVPC
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckPath: /health.html
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+
+
+  # ----------------------------------------------------------
+  # HTTP LISTENER
+  # ----------------------------------------------------------
+
+  WordPressHTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WordPressALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - {Type: redirect, RedirectConfig: {Protocol: HTTPS, Port: '443', StatusCode: HTTP_301}}
+          - {Type: forward, TargetGroupArn: !Ref WordPressTargetGroup}
+
+
+  # ----------------------------------------------------------
+  # OPTIONAL HTTPS LISTENER
+  # ----------------------------------------------------------
+  # Created only when CertificateArn is provided. Use HTTPS for logins.
+
+  WordPressHTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref WordPressALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WordPressTargetGroup
+
+
+  # ==========================================================
+  # AMAZON EFS
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # ENCRYPTED SHARED WORDPRESS STORAGE
+  # ----------------------------------------------------------
+  # Encrypted shared files survive replacement of EC2 instances.
+
+  WordPressEFS:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-WordPress-EFS'
+
+
+  # ----------------------------------------------------------
+  # EFS MOUNT TARGET - AZ 1
+  # ----------------------------------------------------------
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WordPressEFS
+      SubnetId: !Ref PrivateAppSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+
+  # ----------------------------------------------------------
+  # EFS MOUNT TARGET - AZ 2
+  # ----------------------------------------------------------
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WordPressEFS
+      SubnetId: !Ref PrivateAppSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+
+  # ==========================================================
+  # AMAZON RDS
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # DATABASE SUBNET GROUP
+  # ----------------------------------------------------------
+
+  WordPressDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private database subnets for WordPress
+      SubnetIds:
+        - !Ref PrivateDBSubnet1
+        - !Ref PrivateDBSubnet2
+
+
+  # ----------------------------------------------------------
+  # MULTI-AZ MARIADB DATABASE
+  # ----------------------------------------------------------
+  # MultiAZ creates a failover standby, not a read replica.
+
+  WordPressDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mariadb
+      DBInstanceClass: !FindInMap [EnvironmentConfig, !Ref EnvironmentName, DBInstanceClass]
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: true
+      PubliclyAccessible: false
+      DBName: wordpress
+      MasterUsername: wpadmin
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref WordPressDBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+
+
+  # ==========================================================
+  # IAM
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # WORDPRESS EC2 INSTANCE ROLE
+  # ----------------------------------------------------------
+
+  WordPressEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+
+
+  # ----------------------------------------------------------
+  # DATABASE SECRET ACCESS POLICY
+  # ----------------------------------------------------------
+  # !GetAtt obtains the ARN of the RDS-managed secret.
+
+  WordPressSecretsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: WordPressDatabaseSecretAccess
+      Roles:
+        - !Ref WordPressEC2Role
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !GetAtt WordPressDatabase.MasterUserSecret.SecretArn
+
+
+  # ----------------------------------------------------------
+  # EC2 INSTANCE PROFILE
+  # ----------------------------------------------------------
+  # !Ref connects the EC2 role to an instance profile.
+
+  WordPressInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WordPressEC2Role
+
+
+  # ==========================================================
+  # EC2 AUTO SCALING
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # EC2 LAUNCH TEMPLATE
+  # ----------------------------------------------------------
+  # !FindInMap chooses instance type; !GetAtt links the IAM profile.
+
+  WordPressLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-WordPress-LT'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !FindInMap [EnvironmentConfig, !Ref EnvironmentName, InstanceType]
+        IamInstanceProfile:
+          Arn: !GetAtt WordPressInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WordPressSecurityGroup
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${EnvironmentName}-WordPress-ASG-Instance'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+              - Key: Project
+                Value: CloudFormation-WordPress-Automation
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            umask 077
+            export AWS_DEFAULT_REGION='${AWS::Region}'
+            export DB_HOST='${WordPressDatabase.Endpoint.Address}'
+            export DB_NAME='wordpress'
+            export DB_SECRET_ARN='${WordPressDatabase.MasterUserSecret.SecretArn}'
+
+            # Install packages needed to serve WordPress and mount EFS.
+            dnf install -y httpd php php-mysqlnd php-fpm php-mbstring php-xml php-gd php-intl php-zip \
+            mariadb105 amazon-efs-utils awscli jq python3 util-linux
+            systemctl enable httpd php-fpm
+            mkdir -p /var/www/html
+
+            # Wait for EFS mount target/DNS propagation; never install on local disk.
+            for attempt in $(seq 1 30); do
+              if mount -t efs -o tls '${WordPressEFS}:/' /var/www/html; then
+                break
+              fi
+              echo "EFS mount pending, attempt $attempt/30"
+              sleep 10
+            done
+            mountpoint -q /var/www/html || { echo 'EFS mount failed'; exit 1; }
+            echo '${WordPressEFS}:/ /var/www/html efs _netdev,tls 0 0' >> /etc/fstab
+
+            # Fetch secret without echoing it or passing password on command line.
+            DB_SECRET=$(aws secretsmanager get-secret-value \
+              --secret-id "$DB_SECRET_ARN" --query SecretString --output text)
+            export DB_USER DB_PASSWORD
+            DB_USER=$(printf '%s' "$DB_SECRET" | jq -er '.username')
+            DB_PASSWORD=$(printf '%s' "$DB_SECRET" | jq -er '.password')
+            unset DB_SECRET
+
+            # Wait for the database to accept connections.
+            DB_READY=false
+            for attempt in $(seq 1 30); do
+              if MYSQL_PWD="$DB_PASSWORD" mariadb --host="$DB_HOST" --user="$DB_USER" \
+                  --ssl --database="$DB_NAME" --execute='SELECT 1;' >/dev/null 2>&1; then
+                DB_READY=true
+                break
+              fi
+              echo "RDS not ready, attempt $attempt/30"
+              sleep 10
+            done
+            [ "$DB_READY" = true ] || { echo 'RDS connection failed'; exit 1; }
+
+            # Shared NFSv4 lock prevents two instances from initializing together.
+            exec 9>/var/www/html/.wordpress-install.lock
+            flock -x 9
+            if [ ! -f /var/www/html/.wordpress-ready ]; then
+              echo 'Initializing shared WordPress installation'
+              mkdir -p /tmp/wordpress-download
+              curl --fail --silent --show-error --location --retry 3 \
+                https://wordpress.org/latest.tar.gz -o /tmp/wordpress.tar.gz
+              tar -xzf /tmp/wordpress.tar.gz -C /tmp/wordpress-download
+              cp -a /tmp/wordpress-download/wordpress/. /var/www/html/
+
+              # Generate salts into a temporary file, then use them in wp-config.
+              curl --fail --silent --show-error --location --retry 3 \
+                https://api.wordpress.org/secret-key/1.1/salt/ \
+                -o /root/.wordpress-salts.tmp
+              mv -f /root/.wordpress-salts.tmp /root/.wordpress-salts
+
+              # Python safely escapes PHP single-quoted values and writes atomically.
+              python3 - <<'PY'
+            import os
+            import re
+            from pathlib import Path
+
+            root = Path('/var/www/html')
+            sample = (root / 'wp-config-sample.php').read_text()
+            def php_quote(value):
+                return "'" + value.replace('\\', '\\\\').replace("'", "\\'") + "'"
+            replacements = {
+                'DB_NAME': os.environ['DB_NAME'],
+                'DB_USER': os.environ['DB_USER'],
+                'DB_PASSWORD': os.environ['DB_PASSWORD'],
+                'DB_HOST': os.environ['DB_HOST'],
+            }
+            for key, value in replacements.items():
+                pattern = r"define\(\s*'" + key + r"'\s*,\s*'[^']*'\s*\);"
+                new_line = "define( '" + key + "', " + php_quote(value) + " );"
+                sample, count = re.subn(pattern, lambda _: new_line, sample, count=1)
+                if count != 1:
+                    raise RuntimeError('Missing WordPress config setting: ' + key)
+            salts = Path('/root/.wordpress-salts').read_text()
+            sample, count = re.subn(
+                r"(?m)^define\(\s*'AUTH_KEY'.*?^define\(\s*'NONCE_SALT'[^\n]*\n",
+                lambda _: salts.rstrip() + '\n', sample, count=1, flags=re.S | re.M)
+            if count != 1:
+                raise RuntimeError('Could not replace WordPress auth salts')
+            # Configure HTTPS detection before WordPress bootstrap executes.
+            forwarded = "if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') { $_SERVER['HTTPS'] = 'on'; }\n"
+            sample = sample.replace("<?php", "<?php\n" + forwarded, 1)
+                    # Require TLS for WordPress database connections.
+            db_tls = (
+                "define('MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL);\n"
+            )
+            marker = "/* That's all, stop editing!"
+
+            if marker not in sample:
+                raise RuntimeError('WordPress configuration marker not found')
+
+            sample = sample.replace(marker, db_tls + "\n" + marker, 1)
+            config_tmp = root / '.wp-config.php.tmp'
+            config_tmp.write_text(sample)
+            os.chmod(config_tmp, 0o600)
+            config_tmp.replace(root / 'wp-config.php')
+            PY
+
+              # Only mark ready after files and configuration are complete.
+              chown -R apache:apache /var/www/html
+              find /var/www/html -type d -exec chmod 755 {} +
+              find /var/www/html -type f -exec chmod 644 {} +
+              chmod 640 /var/www/html/wp-config.php
+              rm -f /root/.wordpress-salts
+              chmod 600 /var/www/html/.wordpress-install.lock
+              touch /var/www/html/.wordpress-ready
+            fi
+            flock -u 9
+            exec 9>&-
+            unset DB_PASSWORD DB_USER
+            
+            # Create an instance-specific health endpoint outside shared EFS storage.
+            mkdir -p /var/www/health
+            chmod 755 /var/www/health
+            printf 'healthy\n' > /var/www/health/health.html
+            chmod 644 /var/www/health/health.html
+
+            # Apache serves /health.html from local EC2 storage, not EFS.
+            cat > /etc/httpd/conf.d/wordpress-health.conf <<'HEALTH'
+            Alias /health.html /var/www/health/health.html
+
+            <Directory "/var/www/health">
+                Require all granted
+            </Directory>
+            HEALTH
+
+            # Block HTTP access to sensitive WordPress files.
+            cat > /etc/httpd/conf.d/wordpress-security.conf <<'SECURITY'
+            <Directory "/var/www/html">
+                <FilesMatch "^(wp-config\.php(\..*)?|\.wp-config\.php(\..*)?|\.wordpress-.*)$">
+                    Require all denied
+                </FilesMatch>
+            </Directory>
+            SECURITY
+
+            # Start services only after initialization succeeds.
+            systemctl start php-fpm
+            systemctl restart httpd
+
+            echo 'WordPress initialization completed'
+
+  # ==========================================================
+  # AUTO SCALING
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # AUTO SCALING GROUP - TWO AVAILABILITY ZONES
+  # ----------------------------------------------------------
+  # !Ref supplies the private subnet IDs and target group ARN.
+  # The ASG automatically replaces unhealthy EC2 instances.
+
+  WordPressAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - EFSMountTarget1
+      - EFSMountTarget2
+      - PrivateAppDefaultRoute1
+      - PrivateAppDefaultRoute2
+      - WordPressHTTPListener
+      - WordPressSecretsPolicy
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PrivateAppSubnet1
+        - !Ref PrivateAppSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WordPressLaunchTemplate
+        Version: !GetAtt WordPressLaunchTemplate.LatestVersionNumber
+      MinSize: !FindInMap [EnvironmentConfig, !Ref EnvironmentName, MinCapacity]
+      DesiredCapacity: !FindInMap [EnvironmentConfig, !Ref EnvironmentName, DesiredCapacity]
+      MaxSize: !FindInMap [EnvironmentConfig, !Ref EnvironmentName, MaxCapacity]
+      TargetGroupARNs:
+        - !Ref WordPressTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 900
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-WordPress-ASG'
+          PropagateAtLaunch: true
+
+
+  # ==========================================================
+  # DEVELOPMENT SCHEDULING
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # EVENTBRIDGE SCHEDULER IAM ROLE
+  # ----------------------------------------------------------
+  # Scheduler changes ASG capacity, never stops individual ASG instances.
+
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: IsDevelopment
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WordPressDevelopmentScheduling
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: autoscaling:UpdateAutoScalingGroup
+                Resource: !GetAtt WordPressAutoScalingGroup.AutoScalingGroupARN
+
+
+  # ----------------------------------------------------------
+  # WEEKDAY START SCHEDULE - 9 AM EASTERN
+  # ----------------------------------------------------------
+
+  DevelopmentStartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsDevelopment
+    Properties:
+      Description: Scale development WordPress to two instances at 9 AM Eastern weekdays
+      ScheduleExpression: 'cron(0 9 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      State: DISABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:autoscaling:updateAutoScalingGroup
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        Input: !Sub '{"AutoScalingGroupName":"${WordPressAutoScalingGroup}","MinSize":2,"DesiredCapacity":2}'
+
+
+  # ----------------------------------------------------------
+  # WEEKDAY STOP SCHEDULE - 6 PM EASTERN
+  # ----------------------------------------------------------
+  # EC2 scales to zero, but NAT, ALB, EFS, and RDS still incur costs.
+
+  DevelopmentStopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsDevelopment
+    Properties:
+      Description: Scale development WordPress to zero at 6 PM Eastern weekdays
+      ScheduleExpression: 'cron(0 18 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      State: DISABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:autoscaling:updateAutoScalingGroup
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        Input: !Sub '{"AutoScalingGroupName":"${WordPressAutoScalingGroup}","MinSize":0,"DesiredCapacity":0}'
+
+
+  # ==========================================================
+  # CLOUDWATCH MONITORING
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # HIGH CPU ALARM
+  # ----------------------------------------------------------
+  # Observation only. No notification action is configured.
+
+  WordPressHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Average ASG CPU above 80 percent for 10 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WordPressAutoScalingGroup
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+
+Outputs:
+  WordPressALBDNS:
+    Description: ALB DNS name
+    Value: !GetAtt WordPressALB.DNSName
+  WordPressHTTPTestURL:
+    Description: HTTP ALB DNS for basic connectivity testing only; redirects to HTTPS if certificate provided
+    Value: !Sub 'http://${WordPressALB.DNSName}'
+  HTTPSAccessNote:
+    Description: HTTPS requires a domain DNS record pointing to ALB and a matching ACM certificate
+    Value: !If [HasCertificate, 'Use https://YOUR-DOMAIN after DNS setup', 'HTTPS not configured; do not enter WordPress credentials over HTTP']
+  WordPressAutoScalingGroupName:
+    Value: !Ref WordPressAutoScalingGroup
+  WordPressEFSId:
+    Value: !Ref WordPressEFS
+  WordPressRDSEndpoint:
+    Value: !GetAtt WordPressDatabase.Endpoint.Address

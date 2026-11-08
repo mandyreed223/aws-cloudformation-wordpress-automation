@@ -1,0 +1,44 @@
+# Python generated files
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*secret*
+!*.example
+
+# AWS CLI generated files
+acm-validation.json
+scheduler-start-target.json
+scheduler-stop-target.json
+wordpress-dns-change.json
+wordpress-dns-delete.json
+
+# Local troubleshooting and debugging files
+wordpress-wpdb-check.php
+
+# Terraform files (if added later)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+
+# Editor and operating system files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
